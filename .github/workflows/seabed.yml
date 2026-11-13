@@ -1,0 +1,106 @@
+name: CICE seabed quantile red-green
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  full-cice:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, corrected]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tcsh gfortran gcc make openmpi-bin libopenmpi-dev netcdf-bin libnetcdf-dev libnetcdff-dev pkg-config
+      - name: Official source
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/CICE-Consortium/CICE.git cice
+          git -C cice rev-parse HEAD | tee cice-sha.txt
+          git -C cice submodule status | tee submodules.txt
+      - name: Build research-only, identical synthetic shallow bathymetry and quantile diagnostics
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          p=Path("cice/cicecore/cicedyn/dynamics/ice_dyn_shared.F90")
+          s=p.read_text()
+          start=s.index("      subroutine seabed_stress_factor_prob (")
+          end=s.index("      end subroutine seabed_stress_factor_prob",start)
+          part=s[start:end]
+          old="x_kmax = exp(mu_i + sqrt(c2*sigma_i)*1.9430d0)"
+          assert part.count(old)==1
+          if os.environ["VARIANT"]=="corrected":
+              part=part.replace(old,"x_kmax = exp(mu_i + sqrt(c2)*sigma_i*1.9430d0)")
+          target="            x_kmax = min(cut, x_kmax)"
+          assert part.count(target)==1
+          part=part.replace(target,target+"""
+            if (ij <= 10) write(*,'(A, I5, 5(1X,ES16.8))') &
+                'SEABED_QUANTILE_SAMPLE',ij,m_i,v_i,sigma_i,x_kmax,hwater(i,j)
+""")
+          anchor="      if (grid_ice == \"B\") then"
+          assert part.count(anchor)==1
+          part=part.replace(anchor,"      write(*,'(A,1X,ES22.12,1X,I10)') 'SEABED_TBT_SUM', &\n           sum(Tbt), count(Tbt > c0)\n\n"+anchor)
+          p.write_text(s[:start]+part+s[end:])
+          p=Path("cice/cicecore/cicedyn/infrastructure/ice_grid.F90")
+          s=p.read_text()
+          start=s.index("      subroutine get_bathymetry\n")
+          end=s.index("      end subroutine get_bathymetry",start)
+          part=s[start:end]
+          # This is a research forcing fixture, NOT a physics fix.
+          part=part+"      bathymetry = 10.0_dbl_kind  ! RESEARCH FIXTURE: shallow bathymetry\n\n"
+          p.write_text(s[:start]+part+s[end:])
+          PY
+      - name: Setup official stand-alone CICE box run
+        working-directory: cice
+        run: |
+          ./cice.setup --test smoke --mach travisCI --env gnu --testid seabed-quantile --grid gbox80 --pes 1x1 --set boxnodyn
+      - name: Enable probabilistic seabed scheme and validate namelist
+        working-directory: cice
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          matches=list(Path(".").glob("travisCI_gnu_smoke_gbox80*boxnodyn*"))
+          assert len(matches)==1,matches
+          p=matches[0]/"ice_in"
+          s=p.read_text()
+          assert re.search(r"(?m)^\s*seabed_stress\s*=\s*\.true\.",s)
+          s,n=re.subn(r"(?m)^\s*seabed_stress_method\s*=\s*'[^']+'", "    seabed_stress_method = 'probabilistic'",s)
+          assert n==1, "expected one seabed_stress_method in case namelist"
+          p.write_text(s)
+          for key in ["seabed_stress","seabed_stress_method","kdyn","npt","ice_ic"]:
+              m=re.search(r"(?m)^\s*"+key+r"\s*=.*$",s)
+              assert m,key
+              print(m.group(0))
+          Path("research-case-path.txt").write_text(str(matches[0]))
+          PY
+      - name: Build and run official CICE driver
+        working-directory: cice
+        run: |
+          case_dir=$(<research-case-path.txt)
+          cd "$case_dir"
+          ./cice.build
+          ./cice.submit
+          cat test_output
+          if grep -q '^FAIL ' test_output; then exit 2; fi
+          printf '\nRESEARCH EVIDENCE:\n'
+          grep -E 'SEABED_QUANTILE_SAMPLE|SEABED_TBT_SUM' logs/* | tail -50 || true
+      - name: Preserve results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seabed-${{ matrix.variant }}-${{ github.run_id }}
+          path: |
+            cice-sha.txt
+            submodules.txt
+            cice/travisCI_gnu_smoke*/ice_in
+            cice/travisCI_gnu_smoke*/test_output
+            cice/travisCI_gnu_smoke*/logs/*
+          if-no-files-found: ignore
