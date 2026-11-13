@@ -1,0 +1,41 @@
+name: Check Arctic landfast-ice observation dataset
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Retrieve independent observed landfast extent
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import urllib.request,json,zipfile,io,hashlib,collections,re,os
+          record="https://zenodo.org/api/records/19546997"
+          d=json.load(urllib.request.urlopen(record,timeout=45))
+          print("TITLE",d["metadata"]["title"])
+          print("DOI",d["doi"])
+          files=d["files"]
+          for f in files: print("FILE",f["key"],"SIZE",f["size"],"MD5",f.get("checksum"))
+          z=next(f for f in files if f["key"].endswith(".zip"))
+          u=z["links"]["self"]
+          with urllib.request.urlopen(u,timeout=120) as resp: buf=resp.read()
+          print("ZIP_BYTES",len(buf),"MD5",hashlib.md5(buf).hexdigest())
+          assert len(buf)==z["size"],"size mismatch"
+          if str(z.get("checksum","")).startswith("md5:"): assert hashlib.md5(buf).hexdigest()==z["checksum"].split(":",1)[1]
+          with zipfile.ZipFile(io.BytesIO(buf)) as ar:
+              listing=ar.infolist()
+              print("ZIP_ENTRIES",len(listing),"UNCOMPRESSED_BYTES",sum(i.file_size for i in listing))
+              suffixes=collections.Counter(os.path.splitext(i.filename)[1].lower() for i in listing)
+              print("SUFFIXES",suffixes)
+              for i in listing[:20]: print("ENTRY",i.filename,i.file_size)
+              # Only inventory: actual model-vs-observation alignment needs matched model grids/dates.
+              years=collections.Counter()
+              for i in listing:
+                  for y in re.findall(r'(?<!\d)(?:19[789]\d|20[012]\d)(?!\d)',i.filename):years[y]+=1
+              print("YEARS_IN_FILENAMES",years.most_common(12))
+          print("DATASET_ACCESS_VALIDATED",True)
+          PY
