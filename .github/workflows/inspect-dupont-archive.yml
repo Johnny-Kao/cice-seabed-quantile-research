@@ -1,0 +1,62 @@
+name: Inspect archived Dupont CICE-NEMO source
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download published source archive and inspect without executing it
+        run: |
+          curl --fail --location --retry 3 --connect-timeout 35 --max-time 800             https://zenodo.org/api/records/6534162/files/CODE_Dupont_et_al_2022.tgz/content             -o /tmp/dupont-2022.tgz
+          sha256sum /tmp/dupont-2022.tgz
+          python3 - <<'PY'
+          import tarfile,re
+          from pathlib import Path
+          f='/tmp/dupont-2022.tgz'
+          names=[]
+          found=[]
+          interesting=[]
+          with tarfile.open(f,'r:gz') as ar:
+              for m in ar:
+                  if not m.isfile():
+                      continue
+                  names.append(m.name)
+                  name=m.name.lower()
+                  if any(q in name for q in ('ice_dyn_shared','seabed','grounding','readme','namelist','calibrat')) and len(interesting)<120:
+                      interesting.append((m.name,m.size))
+                  if m.size>5_000_000:
+                      continue
+                  if not name.endswith(('.f90','.f','.for','.f95','.txt','.md','.rst','.nml','.h','.inc')):
+                      continue
+                  if not (('/ice' in name) or ('seabed' in name) or ('dyn' in name) or ('parameter' in name) or ('grounding' in name)):
+                      continue
+                  b=ar.extractfile(m).read()
+                  if not any(x in b.lower() for x in (b'1.943',b'x_kmax',b'seabed_stress_factor_prob',b'quantile')):
+                      continue
+                  s=b.decode('utf-8','replace')
+                  lines=s.splitlines()
+                  hits=[]
+                  for i,line in enumerate(lines):
+                      if any(q in line.lower() for q in ('1.943','x_kmax','sigma_i =','seabed_stress_factor_prob','quantile','percentile')):
+                          hits.append({'line':i+1,'snippet':' | '.join(lines[max(0,i-2):min(len(lines),i+3)])[:600]})
+                  if hits: found.append((m.name,hits[:30]))
+          print('ARCHIVE_FILES',len(names))
+          print('INTERESTING_NAMES',interesting[:120])
+          print('MATCHES',len(found))
+          for name,hits in found[:35]:
+              print('MATCH_FILE',name)
+              for hit in hits: print('MATCH_LINE',hit)
+          Path('ARCHIVE_INSPECTION.txt').write_text('Archive files: '+str(len(names))+'\n'+'\n'.join('FILE '+n+'\n'+'\n'.join(str(h) for h in hs) for n,hs in found))
+          assert names, 'archive empty'
+          PY
+      - name: Save inspection report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dupont-archive-source-inspection
+          path: ARCHIVE_INSPECTION.txt
+          if-no-files-found: warn
